@@ -14,10 +14,12 @@ use inkwell::OptimizationLevel;
 use inkwell::{AddressSpace, IntPredicate};
 
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
 
 use crate::ebpf::{self, Insn};
+use crate::elf::Executable;
 use crate::error::EbpfError;
+use crate::static_analysis::Analysis;
+use crate::vm::ContextObject;
 
 /// JIT compiler abstraction for ebpf
 pub struct LLVMJitCompiler<'ctx> {
@@ -25,7 +27,10 @@ pub struct LLVMJitCompiler<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     /// map of starting pc -> function value
-    function_map: BTreeMap<usize, FunctionValue<'ctx>>,
+    function_map_by_pc: BTreeMap<usize, FunctionValue<'ctx>>,
+    /// map of internal function hash -> function value
+    function_map_by_hash: BTreeMap<u32, FunctionValue<'ctx>>,
+    syscall_map: BTreeMap<u32, FunctionValue<'ctx>>,
 }
 
 struct PerFunctionEnv<'ctx> {
@@ -35,21 +40,6 @@ struct PerFunctionEnv<'ctx> {
     register_map: HashMap<u8, PointerValue<'ctx>>,
     /// maps starting pc to block
     basic_block_map: HashMap<usize, BasicBlock<'ctx>>,
-}
-
-/// Errors that can occur during eBPF --> LLVM IR compilation
-#[derive(Debug)]
-pub enum LLVMError {
-    /// Invalid eBPF input
-    EbpfError(EbpfError),
-}
-
-impl fmt::Display for LLVMError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EbpfError(e) => write!(f, "{}", e),
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -108,7 +98,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         ebpf_register_id: u8,
         value: IntValue,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let &ptr_value = per_function_env
             .register_map
             .get(&ebpf_register_id)
@@ -121,7 +111,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         ebpf_register_id: u8,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<IntValue<'ctx>, LLVMError> {
+    ) -> Result<IntValue<'ctx>, EbpfError> {
         let &src_ptr_value = per_function_env
             .register_map
             .get(&ebpf_register_id)
@@ -135,7 +125,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         src_ptr: IntValue,
         value: IntValue,
         operand_size: MemoryOperandSize,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let intptr_type = self.intptr_type(operand_size);
         let int_type = self.int_type(operand_size);
         let src_ptr_casted = self.builder.build_int_to_ptr(src_ptr, intptr_type, "");
@@ -148,7 +138,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         src_ptr: IntValue<'ctx>,
         operand_size: MemoryOperandSize,
-    ) -> Result<IntValue<'ctx>, LLVMError> {
+    ) -> Result<IntValue<'ctx>, EbpfError> {
         let intptr_type = self.intptr_type(operand_size);
         let src_ptr_casted = self.builder.build_int_to_ptr(src_ptr, intptr_type, "");
         let loaded_value = self.builder.build_load(src_ptr_casted, "").into_int_value();
@@ -159,7 +149,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         value: Value,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<IntValue<'ctx>, LLVMError> {
+    ) -> Result<IntValue<'ctx>, EbpfError> {
         // for now, don't translate the address, and simply move it to a register
         match value {
             Value::RegisterPlusConstant64(reg, offset, _) => {
@@ -182,7 +172,9 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             context: &context,
             module,
             builder,
-            function_map: BTreeMap::new(),
+            function_map_by_pc: BTreeMap::new(),
+            function_map_by_hash: BTreeMap::new(),
+            syscall_map: BTreeMap::new(),
         })
     }
 
@@ -190,7 +182,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         insn: Insn,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let operand_size = match insn.opc {
             ebpf::LD_B_REG => MemoryOperandSize::One,
             ebpf::LD_H_REG => MemoryOperandSize::Two,
@@ -214,7 +206,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         insn: Insn,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let operand_size = match insn.opc {
             ebpf::ST_B_IMM => MemoryOperandSize::One,
             ebpf::ST_H_IMM => MemoryOperandSize::Two,
@@ -235,7 +227,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         insn: Insn,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let operand_size = match insn.opc {
             ebpf::ST_B_REG => MemoryOperandSize::One,
             ebpf::ST_H_REG => MemoryOperandSize::Two,
@@ -256,7 +248,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         insn: Insn,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let imm_value = self.context.i64_type().const_int(insn.imm as u64, true);
         let dst_reg_value = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
         let store_value = match insn.opc {
@@ -292,7 +284,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         insn: Insn,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let src_reg_value = self.translate_read_ebpf_register(insn.src, per_function_env)?;
         let dst_reg_value = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
         let store_value = match insn.opc {
@@ -334,7 +326,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         insn: Insn,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let imm_value = self.context.i64_type().const_int(insn.imm as u64, true);
         let dst_reg_value = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
         let store_value = match insn.opc {
@@ -370,7 +362,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         &self,
         insn: Insn,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<(), LLVMError> {
+    ) -> Result<(), EbpfError> {
         let src_reg_value = self.translate_read_ebpf_register(insn.src, per_function_env)?;
         let dst_reg_value = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
         let store_value = match insn.opc {
@@ -414,7 +406,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         target_if: usize,
         target_else: usize,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<NextTranslationTask, LLVMError> {
+    ) -> Result<NextTranslationTask, EbpfError> {
         let predicate = match insn.opc {
             ebpf::JEQ_IMM => IntPredicate::EQ,
             ebpf::JGT_IMM => IntPredicate::UGT,
@@ -444,7 +436,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         target_if: usize,
         target_else: usize,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<NextTranslationTask, LLVMError> {
+    ) -> Result<NextTranslationTask, EbpfError> {
         let predicate = match insn.opc {
             ebpf::JEQ_REG => IntPredicate::EQ,
             ebpf::JGT_REG => IntPredicate::UGT,
@@ -470,18 +462,16 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
 
     fn translate_instruction(
         &self,
-        ebpf_program: &[u8],
+        analysis: &Analysis,
         mut pc: usize,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<NextTranslationTask, LLVMError> {
-        let mut insn = ebpf::get_insn(ebpf_program, pc);
+    ) -> Result<NextTranslationTask, EbpfError> {
+        let insn = analysis.instructions.get(pc).unwrap().clone();
         let target_pc = (pc as isize + insn.off as isize + 1) as usize;
 
         match insn.opc {
             // because this instruction takes two instructions, it is handled separately
             ebpf::LD_DW_IMM => {
-                pc += 1;
-                ebpf::augment_lddw_unchecked(ebpf_program, &mut insn);
                 self.translate_write_ebpf_register(
                     insn.dst,
                     self.context.i64_type().const_int(insn.imm as u64, true),
@@ -527,6 +517,11 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             | ebpf::XOR32_REG
             | ebpf::ARSH32_REG => {
                 self.translate_instruction_alu32_reg(insn, per_function_env)?;
+            }
+            ebpf::NEG32 => {
+                let value = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
+                let negated = self.builder.build_int_neg(value, "");
+                self.translate_write_ebpf_register(insn.dst, negated, per_function_env)?;
             }
             ebpf::MOV32_IMM => {
                 let imm_value = self.context.i64_type().const_int(insn.imm as u64, true);
@@ -628,6 +623,20 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             | ebpf::ARSH64_REG => {
                 self.translate_instruction_alu64_reg(insn, per_function_env)?;
             }
+            ebpf::NEG64 => {
+                let value = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
+                let negated = self.builder.build_int_neg(value, "");
+                self.translate_write_ebpf_register(insn.dst, negated, per_function_env)?;
+            }
+            ebpf::MOV64_IMM => {
+                let imm_value = self.context.i64_type().const_int(insn.imm as u64, true);
+                self.translate_write_ebpf_register(insn.dst, imm_value, per_function_env)?;
+            }
+            ebpf::MOV64_REG => {
+                let src_reg_value =
+                    self.translate_read_ebpf_register(insn.src, per_function_env)?;
+                self.translate_write_ebpf_register(insn.dst, src_reg_value, per_function_env)?;
+            }
             // BPF_JMP class
             ebpf::JA => return Ok(NextTranslationTask::Jmp { target_pc }),
             ebpf::JEQ_IMM
@@ -697,7 +706,14 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
                 });
             }
             ebpf::CALL_IMM => {
-                let &function = self.function_map.get(&target_pc).unwrap();
+                let func_hash = insn.imm as u32;
+                let function = if let Some(func) = self.syscall_map.get(&func_hash) {
+                    *func
+                } else if let Some(func) = self.function_map_by_hash.get(&func_hash) {
+                    *func
+                } else {
+                    return Err(EbpfError::UnsupportedInstruction(pc));
+                };
                 self.builder.build_call(function, &[], "");
             }
             ebpf::CALL_REG => {
@@ -711,9 +727,10 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             }
             ebpf::EXIT => return Ok(NextTranslationTask::Exit),
             _ => {
-                return Err(LLVMError::EbpfError(EbpfError::UnsupportedInstruction(
+                println!("unsupported opcode {:b} {:b}", insn.opc, ebpf::MOV32_REG);
+                return Err(EbpfError::UnsupportedInstruction(
                     pc + ebpf::ELF_INSN_DUMP_OFFSET,
-                )))
+                ));
             }
         }
         pc += 1;
@@ -722,10 +739,10 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
 
     fn translate_basic_block(
         &self,
-        ebpf_program: &[u8],
+        analysis: &Analysis,
         mut pc: usize,
         per_function_env: &mut PerFunctionEnv<'ctx>,
-    ) -> Result<BasicBlock<'ctx>, LLVMError> {
+    ) -> Result<BasicBlock<'ctx>, EbpfError> {
         if let Some(block) = per_function_env.basic_block_map.get(&pc) {
             return Ok(*block);
         }
@@ -735,15 +752,15 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         self.builder.position_at_end(block);
         per_function_env.basic_block_map.insert(pc, block);
 
-        while pc * ebpf::INSN_SIZE < ebpf_program.len() {
-            let res = self.translate_instruction(ebpf_program, pc, per_function_env)?;
+        while pc <= analysis.instructions.len() {
+            let res = self.translate_instruction(analysis, pc, per_function_env)?;
             match res {
                 NextTranslationTask::NextPc { target_pc } => {
                     pc = target_pc;
                 }
                 NextTranslationTask::Jmp { target_pc } => {
                     let jump_block =
-                        self.translate_basic_block(ebpf_program, target_pc, per_function_env)?;
+                        self.translate_basic_block(analysis, target_pc, per_function_env)?;
                     self.builder.position_at_end(block);
                     self.builder.build_unconditional_branch(jump_block);
                     return Ok(block);
@@ -754,9 +771,9 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
                     target_else,
                 } => {
                     let if_block =
-                        self.translate_basic_block(ebpf_program, target_if, per_function_env)?;
+                        self.translate_basic_block(analysis, target_if, per_function_env)?;
                     let else_block =
-                        self.translate_basic_block(ebpf_program, target_else, per_function_env)?;
+                        self.translate_basic_block(analysis, target_else, per_function_env)?;
                     self.builder.position_at_end(block);
                     self.builder
                         .build_conditional_branch(predicate, if_block, else_block);
@@ -774,14 +791,10 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
 
     fn translate_function(
         &self,
-        ebpf_program: &[u8],
+        analysis: &Analysis,
         pc: usize,
         function: FunctionValue<'ctx>,
-    ) -> Result<(), LLVMError> {
-        if function.get_basic_blocks().len() > 0 {
-            // function is already compiled
-            return Ok(());
-        }
+    ) -> Result<(), EbpfError> {
         let first_block = self.context.append_basic_block(function, "");
         self.builder.position_at_end(first_block);
 
@@ -805,58 +818,43 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         };
 
         // begin compilation
-        let second_block = self.translate_basic_block(ebpf_program, pc, &mut per_function_env)?;
+        let second_block = self.translate_basic_block(analysis, pc, &mut per_function_env)?;
         self.builder.position_at_end(first_block);
         self.builder.build_unconditional_branch(second_block);
 
         Ok(())
     }
 
-    fn compile(&mut self, ebpf_program: &[u8]) -> Result<(), LLVMError> {
-        let mut pc = 0;
-        let mut counter = 0;
-        while pc * ebpf::INSN_SIZE < ebpf_program.len() {
-            let insn = ebpf::get_insn_unchecked(ebpf_program, pc);
-            let target_pc = (pc as isize + insn.off as isize + 1) as usize;
-            match insn.opc {
-                ebpf::LD_DW_IMM => {
-                    pc += 1;
-                }
-                ebpf::CALL_IMM => {
-                    if target_pc >= ebpf_program.len() {
-                        panic!("OOB!!");
-                    }
-                    let function_ty = self.context.i64_type().fn_type(&[], false);
-                    let function_name = if pc == 0 {
-                        "entrypoint".to_string()
-                    } else {
-                        counter += 1;
-                        format!("func_{}", counter)
-                    };
-                    let function = self.module.add_function(&function_name, function_ty, None);
-                    self.function_map.insert(target_pc, function);
-                }
-                _ => {}
-            }
-            pc += 1;
+    fn compile<C: ContextObject>(&mut self, executable: &Executable<C>) -> Result<(), EbpfError> {
+        let analysis = Analysis::from_executable(executable)?;
+        // add internal functions
+        for (pc, (key, name)) in analysis.functions.iter() {
+            let function_ty = self.context.i64_type().fn_type(&[], false);
+            let function = self.module.add_function(name, function_ty, None);
+            self.function_map_by_pc.insert(*pc, function);
+            self.function_map_by_hash.insert(*key, function);
         }
-
-        for (target_pc, function) in self.function_map.iter() {
-            self.translate_function(ebpf_program, *target_pc, *function)?;
+        // add syscall functions
+        for (syscall_hash, (syscall_name, _)) in analysis.executable.get_loader().iter_functions() {
+            let function_ty = self.context.i64_type().fn_type(&[], false);
+            let function = self.module.add_function(
+                syscall_name,
+                function_ty,
+                Some(inkwell::module::Linkage::ExternalWeak),
+            );
+            self.syscall_map.insert(*syscall_hash, function);
         }
-        let pass_manager = PassManager::create(&self.module);
-        let pass_manager_builder = PassManagerBuilder::create();
-        pass_manager_builder.populate_function_pass_manager(&pass_manager);
-        for (_, function) in self.function_map.iter() {
-            pass_manager.run_on(function);
+        for (&pc, &function) in self.function_map_by_pc.iter() {
+            self.translate_function(&analysis, pc, function)?;
         }
-
         Ok(())
     }
 }
 
 /// Compiles eBPF code to .so bytes
-pub fn jit_compile_llvm(ebpf_program: &[u8]) -> Result<Vec<u8>, LLVMError> {
+pub fn jit_compile_llvm<C: ContextObject>(
+    executable: &Executable<C>,
+) -> Result<Vec<u8>, EbpfError> {
     Target::initialize_x86(&InitializationConfig::default());
     let target = Target::from_name("x86-64").expect("x86-64 unsupported");
     let target_machine = target
@@ -871,7 +869,7 @@ pub fn jit_compile_llvm(ebpf_program: &[u8]) -> Result<Vec<u8>, LLVMError> {
         .expect("Failed to initialize target machine");
     let context = Context::create();
     let mut jit = LLVMJitCompiler::new(&context).expect("Failed to initialize IRgen");
-    jit.compile(ebpf_program)
+    jit.compile(executable)
         .expect("Failed to  generate LLVM IR");
     let machine_code = target_machine
         .write_to_memory_buffer(&jit.module, FileType::Object)

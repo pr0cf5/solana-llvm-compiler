@@ -24,7 +24,7 @@ use crate::{
 };
 use rand::Rng;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{hash_map::Iter, BTreeMap, HashMap},
     fmt::Debug,
     marker::PhantomData,
     mem,
@@ -154,6 +154,10 @@ impl<C: ContextObject> BuiltInProgram<C> {
             }
             + self.functions.capacity()
                 * mem::size_of::<(u32, (&'static str, BuiltInFunction<C>))>()
+    }
+
+    pub fn iter_functions(&self) -> Iter<u32, (&'static str, BuiltInFunction<C>)> {
+        self.functions.iter()
     }
 }
 

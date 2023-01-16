@@ -126,7 +126,7 @@ impl Default for CfgNode {
 /// Result of the executable analysis
 pub struct Analysis<'a> {
     /// The program which is analyzed
-    executable: &'a Executable<TestContextObject>,
+    pub executable: &'a Executable<TestContextObject>,
     /// Plain list of instructions as they occur in the executable
     pub instructions: Vec<ebpf::Insn>,
     /// Functions in the executable
@@ -250,6 +250,8 @@ impl<'a> Analysis<'a> {
                             vec![insn.ptr + 1]
                         };
                         cfg_edges.insert(insn.ptr, (insn.opc, destinations));
+                    } else {
+                        println!("unsupported system call: {:x}", insn.imm as u32);
                     }
                 }
                 ebpf::CALL_REG => {
