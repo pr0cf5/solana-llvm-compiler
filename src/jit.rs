@@ -55,5 +55,6 @@ pub fn jit_compile(elf_bytes: &[u8]) -> Result<Vec<u8>, Error> {
 
     let executable =
         Executable::from_elf(elf_bytes, Arc::new(loader)).map_err(|e| Error::ebpf_error(&e))?;
-    jit_compile_llvm(&executable).map_err(|e| Error::llvm_error(&e))
+    let obj_bytes = jit_compile_llvm(&executable).map_err(|e| Error::llvm_error(&e))?;
+    Ok(obj_bytes)
 }

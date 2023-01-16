@@ -8,19 +8,20 @@ use inkwell::passes::{PassManager, PassManagerBuilder};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetTriple,
 };
-use inkwell::types::{IntType, PointerType};
-use inkwell::values::{FunctionValue, IntValue, PointerValue};
+use inkwell::types::{BasicMetadataTypeEnum, FunctionType, IntType, PointerType};
+use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::OptimizationLevel;
 use inkwell::{AddressSpace, IntPredicate};
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
 
 use crate::ebpf::{self, Insn};
 use crate::elf::Executable;
 use crate::error::EbpfError;
 use crate::static_analysis::Analysis;
 use crate::vm::ContextObject;
+
+const EBPF_REGISTER_CNT: u8 = 11;
 
 /// JIT compiler abstraction for ebpf
 pub struct LLVMJitCompiler<'ctx> {
@@ -61,6 +62,7 @@ enum MemoryOperandSize {
 }
 
 enum NextTranslationTask<'ctx> {
+    #[allow(unused)]
     NextPc {
         target_pc: usize,
     },
@@ -74,6 +76,7 @@ enum NextTranslationTask<'ctx> {
     },
     Call {
         target: FunctionValue<'ctx>,
+        is_syscall: bool,
     },
     Exit,
 }
@@ -95,6 +98,18 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             MemoryOperandSize::Four => self.context.i32_type(),
             MemoryOperandSize::Eight => self.context.i64_type(),
         }
+    }
+
+    fn generic_function_type(&self) -> FunctionType<'ctx> {
+        let mut generic_param_tys: Vec<BasicMetadataTypeEnum> = vec![];
+        for _ in 0..EBPF_REGISTER_CNT {
+            generic_param_tys.push(self.context.i64_type().into());
+        }
+        let generic_function_ty = self
+            .context
+            .i64_type()
+            .fn_type(generic_param_tys.as_slice(), false);
+        return generic_function_ty;
     }
 
     fn translate_write_ebpf_register(
@@ -410,7 +425,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         target_if: usize,
         target_else: usize,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<NextTranslationTask, EbpfError> {
+    ) -> Result<NextTranslationTask<'ctx>, EbpfError> {
         let predicate = match insn.opc {
             ebpf::JEQ_IMM => IntPredicate::EQ,
             ebpf::JGT_IMM => IntPredicate::UGT,
@@ -440,7 +455,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         target_if: usize,
         target_else: usize,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<NextTranslationTask, EbpfError> {
+    ) -> Result<NextTranslationTask<'ctx>, EbpfError> {
         let predicate = match insn.opc {
             ebpf::JEQ_REG => IntPredicate::EQ,
             ebpf::JGT_REG => IntPredicate::UGT,
@@ -464,12 +479,37 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         });
     }
 
+    fn build_function_call(
+        &self,
+        function: FunctionValue<'ctx>,
+        per_function_env: &PerFunctionEnv<'ctx>,
+    ) -> Result<(), EbpfError> {
+        // Send all registers.
+        // Registers that are unused will be removed by https://llvm.org/doxygen/DeadArgumentElimination_8cpp_source.html
+        let mut arguments: Vec<BasicMetadataValueEnum> = Vec::new();
+        for i in 0..EBPF_REGISTER_CNT {
+            arguments.push(
+                self.translate_read_ebpf_register(i, per_function_env)?
+                    .into(),
+            );
+        }
+        let return_value = self.builder.build_call(function, arguments.as_slice(), "");
+
+        // Retrieve return value as r0
+        let r0_value = return_value
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        self.translate_write_ebpf_register(0, r0_value, per_function_env)?;
+        Ok(())
+    }
+
     fn translate_instruction(
         &self,
         analysis: &Analysis,
         index: usize,
         per_function_env: &PerFunctionEnv<'ctx>,
-    ) -> Result<NextTranslationTask, EbpfError> {
+    ) -> Result<NextTranslationTask<'ctx>, EbpfError> {
         let insn = analysis.instructions.get(index).unwrap().clone();
         let mut pc = insn.ptr;
         let target_pc = (pc as isize + insn.off as isize + 1) as usize;
@@ -682,12 +722,12 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             ebpf::JSET_IMM => {
                 let lhs = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
                 let rhs = self.context.i64_type().const_int(insn.imm as u64, true);
-                let out = self.builder.build_and(lhs, rhs, "jset_imm.0");
+                let out = self.builder.build_and(lhs, rhs, "");
                 let predicate = self.builder.build_int_compare(
                     IntPredicate::NE,
                     out,
                     self.context.i64_type().const_zero(),
-                    "jset_imm.1",
+                    "",
                 );
                 return Ok(NextTranslationTask::JmpCond {
                     predicate,
@@ -698,12 +738,12 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             ebpf::JSET_REG => {
                 let lhs = self.translate_read_ebpf_register(insn.dst, per_function_env)?;
                 let rhs = self.translate_read_ebpf_register(insn.src, per_function_env)?;
-                let out = self.builder.build_and(lhs, rhs, "jset_reg.0");
+                let out = self.builder.build_and(lhs, rhs, "");
                 let predicate = self.builder.build_int_compare(
                     IntPredicate::NE,
                     out,
                     self.context.i64_type().const_zero(),
-                    "jset_reg.1",
+                    "",
                 );
                 return Ok(NextTranslationTask::JmpCond {
                     predicate,
@@ -713,23 +753,29 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
             }
             ebpf::CALL_IMM => {
                 let func_hash = insn.imm as u32;
-                let function = if let Some(func) = self.syscall_map.get(&func_hash) {
-                    *func
+                let (function, is_syscall) = if let Some(func) = self.syscall_map.get(&func_hash) {
+                    (*func, true)
                 } else if let Some(func) = self.function_map_by_hash.get(&func_hash) {
-                    *func
+                    (*func, false)
                 } else {
                     return Err(EbpfError::UnsupportedInstruction(pc));
                 };
-                self.builder.build_call(function, &[], "");
+                return Ok(NextTranslationTask::Call {
+                    target: function,
+                    is_syscall,
+                });
             }
             ebpf::CALL_REG => {
-                let function_ty = self.context.i64_type().fn_type(&[], false);
+                let generic_function_type = self.generic_function_type();
                 let function = self.module.add_function(
                     &format!("regcall_{}", pc),
-                    function_ty,
+                    generic_function_type,
                     Some(inkwell::module::Linkage::ExternalWeak),
                 );
-                self.builder.build_call(function, &[], "");
+                return Ok(NextTranslationTask::Call {
+                    target: function,
+                    is_syscall: true,
+                });
             }
             ebpf::EXIT => return Ok(NextTranslationTask::Exit),
             _ => {
@@ -786,12 +832,16 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
                         .build_conditional_branch(predicate, if_block, else_block);
                     return Ok(block);
                 }
-                NextTranslationTask::Call { target } => {
-                    self.builder.build_call(target, &[], "");
+                NextTranslationTask::Call { target, is_syscall } => {
+                    if is_syscall {
+                        self.build_function_call(target, per_function_env)?;
+                    } else {
+                        self.build_function_call(target, per_function_env)?;
+                    }
                 }
                 NextTranslationTask::Exit => {
-                    self.builder
-                        .build_return(Some(&self.context.i64_type().const_zero()));
+                    let r0_value = self.translate_read_ebpf_register(0, per_function_env)?;
+                    self.builder.build_return(Some(&r0_value));
                     return Ok(block);
                 }
             }
@@ -799,8 +849,8 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         match cfg_node.destinations.len() {
             0 => {
                 // return
-                self.builder
-                    .build_return(Some(&self.context.i64_type().const_zero()));
+                let r0_value = self.translate_read_ebpf_register(0, per_function_env)?;
+                self.builder.build_return(Some(&r0_value));
                 Ok(block)
             }
             1 => {
@@ -831,11 +881,13 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         // populate register_map
         let int64_type = self.context.i64_type();
         let mut register_map = HashMap::new();
-        for i in 0..11 {
+        for i in 0..EBPF_REGISTER_CNT {
             let alloca_ptr = self
                 .builder
                 .build_alloca(int64_type, &format!("ebpf_register{}", i));
             register_map.insert(i, alloca_ptr);
+            self.builder
+                .build_store(alloca_ptr, function.get_nth_param(i as u32).unwrap());
         }
 
         let mut per_function_env = PerFunctionEnv {
@@ -854,19 +906,26 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
 
     fn compile<C: ContextObject>(&mut self, executable: &Executable<C>) -> Result<(), EbpfError> {
         let analysis = Analysis::from_executable(executable)?;
+        let generic_function_type = self.generic_function_type();
         // add internal functions
         for (pc, (key, name)) in analysis.functions.iter() {
-            let function_ty = self.context.i64_type().fn_type(&[], false);
-            let function = self.module.add_function(name, function_ty, None);
+            let function = if name == "entrypoint" {
+                self.module.add_function(
+                    name,
+                    generic_function_type,
+                    Some(inkwell::module::Linkage::External),
+                )
+            } else {
+                self.module.add_function(name, generic_function_type, None)
+            };
             self.function_map_by_pc.insert(*pc, function);
             self.function_map_by_hash.insert(*key, function);
         }
         // add syscall functions
         for (syscall_hash, (syscall_name, _)) in analysis.executable.get_loader().iter_functions() {
-            let function_ty = self.context.i64_type().fn_type(&[], false);
             let function = self.module.add_function(
                 syscall_name,
-                function_ty,
+                generic_function_type,
                 Some(inkwell::module::Linkage::ExternalWeak),
             );
             self.syscall_map.insert(*syscall_hash, function);
@@ -896,19 +955,18 @@ pub fn jit_compile_llvm<C: ContextObject>(
             &TargetTriple::create("x86_64-pc-linux-gnu"),
             "x86-64",
             "",
-            OptimizationLevel::Default,
-            RelocMode::PIC,
-            CodeModel::Default,
+            OptimizationLevel::Aggressive,
+            RelocMode::Static,
+            CodeModel::Large,
         )
         .expect("Failed to initialize target machine");
     let context = Context::create();
     let mut jit = LLVMJitCompiler::new(&context).expect("Failed to initialize IRgen");
-    jit.compile(executable)
-        .expect("Failed to  generate LLVM IR");
-    let machine_code = target_machine
+    jit.compile(executable).expect("Failed to generate LLVM IR");
+    let object_code = target_machine
         .write_to_memory_buffer(&jit.module, FileType::Object)
         .expect("Failed to generate machine code")
         .as_slice()
         .to_vec();
-    Ok(machine_code)
+    Ok(object_code)
 }
