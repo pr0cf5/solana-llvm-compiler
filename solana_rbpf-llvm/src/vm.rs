@@ -156,6 +156,7 @@ impl<C: ContextObject> BuiltInProgram<C> {
                 * mem::size_of::<(u32, (&'static str, BuiltInFunction<C>))>()
     }
 
+    /// Return an iterator for all functions
     pub fn iter_functions(&self) -> Iter<u32, (&'static str, BuiltInFunction<C>)> {
         self.functions.iter()
     }

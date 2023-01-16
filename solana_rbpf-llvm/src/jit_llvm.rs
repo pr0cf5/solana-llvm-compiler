@@ -14,6 +14,7 @@ use inkwell::OptimizationLevel;
 use inkwell::{AddressSpace, IntPredicate};
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
 
 use crate::ebpf::{self, Insn};
 use crate::elf::Executable;
@@ -70,6 +71,9 @@ enum NextTranslationTask<'ctx> {
         predicate: IntValue<'ctx>,
         target_if: usize,
         target_else: usize,
+    },
+    Call {
+        target: FunctionValue<'ctx>,
     },
     Exit,
 }
@@ -463,10 +467,11 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
     fn translate_instruction(
         &self,
         analysis: &Analysis,
-        mut pc: usize,
+        index: usize,
         per_function_env: &PerFunctionEnv<'ctx>,
     ) -> Result<NextTranslationTask, EbpfError> {
-        let insn = analysis.instructions.get(pc).unwrap().clone();
+        let insn = analysis.instructions.get(index).unwrap().clone();
+        let mut pc = insn.ptr;
         let target_pc = (pc as isize + insn.off as isize + 1) as usize;
 
         match insn.opc {
@@ -477,6 +482,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
                     self.context.i64_type().const_int(insn.imm as u64, true),
                     per_function_env,
                 )?;
+                pc += 1;
             }
             ebpf::LD_B_REG | ebpf::LD_H_REG | ebpf::LD_W_REG | ebpf::LD_DW_REG => {
                 self.translate_instruction_memory_load_reg(insn, per_function_env)?;
@@ -740,7 +746,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
     fn translate_basic_block(
         &self,
         analysis: &Analysis,
-        mut pc: usize,
+        pc: usize,
         per_function_env: &mut PerFunctionEnv<'ctx>,
     ) -> Result<BasicBlock<'ctx>, EbpfError> {
         if let Some(block) = per_function_env.basic_block_map.get(&pc) {
@@ -752,13 +758,13 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         self.builder.position_at_end(block);
         per_function_env.basic_block_map.insert(pc, block);
 
-        while pc <= analysis.instructions.len() {
-            let res = self.translate_instruction(analysis, pc, per_function_env)?;
+        let cfg_node = analysis.cfg_nodes.get(&pc).unwrap();
+        for index in cfg_node.instructions.start..cfg_node.instructions.end {
+            let res = self.translate_instruction(analysis, index, per_function_env)?;
             match res {
-                NextTranslationTask::NextPc { target_pc } => {
-                    pc = target_pc;
-                }
+                NextTranslationTask::NextPc { target_pc: _ } => {}
                 NextTranslationTask::Jmp { target_pc } => {
+                    assert_eq!(cfg_node.destinations.len(), 1);
                     let jump_block =
                         self.translate_basic_block(analysis, target_pc, per_function_env)?;
                     self.builder.position_at_end(block);
@@ -770,6 +776,7 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
                     target_if,
                     target_else,
                 } => {
+                    assert_eq!(cfg_node.destinations.len(), 2);
                     let if_block =
                         self.translate_basic_block(analysis, target_if, per_function_env)?;
                     let else_block =
@@ -779,14 +786,34 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
                         .build_conditional_branch(predicate, if_block, else_block);
                     return Ok(block);
                 }
+                NextTranslationTask::Call { target } => {
+                    self.builder.build_call(target, &[], "");
+                }
                 NextTranslationTask::Exit => {
-                    self.builder.build_return(None);
+                    self.builder
+                        .build_return(Some(&self.context.i64_type().const_zero()));
                     return Ok(block);
                 }
             }
         }
-        self.builder.build_return(None);
-        Ok(block)
+        match cfg_node.destinations.len() {
+            0 => {
+                // return
+                self.builder
+                    .build_return(Some(&self.context.i64_type().const_zero()));
+                Ok(block)
+            }
+            1 => {
+                // go to next block after call unconditionally
+                let next_index = cfg_node.instructions.end;
+                let next_pc = analysis.instructions.get(next_index).unwrap().ptr;
+                let next_block = self.translate_basic_block(analysis, next_pc, per_function_env)?;
+                self.builder.position_at_end(block);
+                self.builder.build_unconditional_branch(next_block);
+                Ok(block)
+            }
+            _ => panic!("unreachable"),
+        }
     }
 
     fn translate_function(
@@ -847,6 +874,13 @@ impl<'ctx> LLVMJitCompiler<'ctx> {
         for (&pc, &function) in self.function_map_by_pc.iter() {
             self.translate_function(&analysis, pc, function)?;
         }
+
+        let pass_manager = PassManager::create(());
+        let pass_manager_builder = PassManagerBuilder::create();
+        pass_manager_builder.set_optimization_level(OptimizationLevel::Aggressive);
+        pass_manager_builder.populate_module_pass_manager(&pass_manager);
+        pass_manager.run_on(&self.module);
+
         Ok(())
     }
 }
